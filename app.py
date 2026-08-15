@@ -15,10 +15,27 @@ Architecture:
     original project's "hover over a toolbar" gesture — mouse input is
     available in a browser, so we spend the hand-tracking budget on the
     part that's actually the point: freehand drawing/erasing in the air.
+
+Hand tracking backend:
+  - Uses MediaPipe's modern Tasks API (`mediapipe.tasks.python.vision
+    .HandLandmarker`), NOT the legacy `mp.solutions.hands` module.
+    `mp.solutions` was removed from the `mediapipe` PyPI package as of the
+    1.0.0 release. Pinning back to an older mediapipe that still has
+    `solutions` isn't a real fix either: those older releases don't ship
+    wheels for current CPython versions, so on any host running a recent
+    Python, `pip install` for them fails outright before the code even
+    runs. The Tasks API is the maintained replacement and is the version
+    that actually installs on modern Python.
+  - The Tasks API needs a small model file (hand_landmarker.task, ~7-30MB)
+    that is NOT bundled in the pip package. It's downloaded once on first
+    run and cached to disk, so subsequent reruns/reconnects reuse it
+    instead of re-downloading.
 """
 
+import os
 import threading
 import time
+import urllib.request
 from collections import deque
 
 import av
@@ -26,6 +43,12 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import streamlit as st
+from mediapipe.tasks.python import BaseOptions
+from mediapipe.tasks.python.vision import (
+    HandLandmarker,
+    HandLandmarkerOptions,
+    RunningMode,
+)
 from streamlit_webrtc import RTCConfiguration, WebRtcMode, webrtc_streamer
 
 # ----------------------------------------------------------------------
@@ -56,6 +79,35 @@ PALETTE = [
 RTC_CONFIGURATION = RTCConfiguration(
     {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 )
+
+# 21-point hand landmark connectivity (matches what MediaPipe's old
+# HAND_CONNECTIONS constant described). Reproduced manually here since the
+# Tasks API doesn't re-export a drawing-connections constant the way the
+# legacy `mp.solutions.hands` module did.
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),          # thumb
+    (0, 5), (5, 6), (6, 7), (7, 8),          # index
+    (5, 9), (9, 10), (10, 11), (11, 12),     # middle
+    (9, 13), (13, 14), (14, 15), (15, 16),   # ring
+    (13, 17), (17, 18), (18, 19), (19, 20),  # pinky
+    (0, 17),                                  # palm base
+]
+
+MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+    "hand_landmarker/float16/1/hand_landmarker.task"
+)
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task")
+
+
+@st.cache_resource(show_spinner="Downloading hand-tracking model (first run only)...")
+def get_landmarker_model_path() -> str:
+    """Download the HandLandmarker model once and cache it on disk.
+    st.cache_resource additionally ensures we don't re-download on every
+    Streamlit rerun within the same running app instance."""
+    if not os.path.exists(MODEL_PATH) or os.path.getsize(MODEL_PATH) < 1_000_000:
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+    return MODEL_PATH
 
 # ----------------------------------------------------------------------
 # Theme — dark "computer-vision HUD" aesthetic
@@ -277,12 +329,17 @@ class PainterProcessor:
     small, lock-protected control attributes."""
 
     def __init__(self):
-        self.hands = mp.solutions.hands.Hands(
-            min_detection_confidence=0.6,
+        model_path = get_landmarker_model_path()
+        options = HandLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=model_path),
+            running_mode=RunningMode.VIDEO,
+            num_hands=1,
+            min_hand_detection_confidence=0.6,
             min_tracking_confidence=0.6,
-            max_num_hands=1,
         )
-        self.draw_utils = mp.solutions.drawing_utils
+        self.landmarker = HandLandmarker.create_from_options(options)
+        self._start_time = time.time()
+        self._last_ts_ms = -1
 
         self.mask = np.ones((FRAME_H, FRAME_W, 3), dtype="uint8") * 255
         self.history = History(self.mask)
@@ -343,21 +400,30 @@ class PainterProcessor:
             self.history.push(self.mask)
 
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        result = self.hands.process(rgb)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        # Tasks API (VIDEO mode) requires strictly increasing timestamps in ms.
+        ts_ms = int((time.time() - self._start_time) * 1000)
+        if ts_ms <= self._last_ts_ms:
+            ts_ms = self._last_ts_ms + 1
+        self._last_ts_ms = ts_ms
+        result = self.landmarker.detect_for_video(mp_image, ts_ms)
 
-        if result.multi_hand_landmarks:
-            for handlms in result.multi_hand_landmarks:
-                self.draw_utils.draw_landmarks(
-                    img, handlms, mp.solutions.hands.HAND_CONNECTIONS,
-                    self.draw_utils.DrawingSpec(color=(94, 234, 212), thickness=1, circle_radius=2),
-                    self.draw_utils.DrawingSpec(color=(167, 139, 250), thickness=1),
-                )
+        if result.hand_landmarks:
+            for hand in result.hand_landmarks:
+                # manual skeleton draw (Tasks API has no drawing_utils helper)
+                for a, b in HAND_CONNECTIONS:
+                    pa = (int(hand[a].x * FRAME_W), int(hand[a].y * FRAME_H))
+                    pb = (int(hand[b].x * FRAME_W), int(hand[b].y * FRAME_H))
+                    cv2.line(img, pa, pb, (94, 234, 212), 1)
+                for lm in hand:
+                    p = (int(lm.x * FRAME_W), int(lm.y * FRAME_H))
+                    cv2.circle(img, p, 2, (167, 139, 250), -1)
 
-                x = int(handlms.landmark[8].x * FRAME_W)
-                y = int(handlms.landmark[8].y * FRAME_H)
-                xi = int(handlms.landmark[12].x * FRAME_W)
-                yi = int(handlms.landmark[12].y * FRAME_H)
-                y9 = int(handlms.landmark[9].y * FRAME_H)
+                x = int(hand[8].x * FRAME_W)
+                y = int(hand[8].y * FRAME_H)
+                xi = int(hand[12].x * FRAME_W)
+                yi = int(hand[12].y * FRAME_H)
+                y9 = int(hand[9].y * FRAME_H)
                 active = index_raised(yi, y9)
 
                 if tool == "draw":
